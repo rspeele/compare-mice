@@ -4,6 +4,7 @@
 #include<stdio.h>
 #include<stdlib.h>
 #include<math.h>
+#include<time.h>
 
 #define USAGE_PAGE_GENERIC_DESKTOP 0x01
 #define USAGE_MOUSE 0x02
@@ -16,6 +17,9 @@ typedef struct winrawdev_s
     DWORD type;
     struct { int dx, dy; } history;
     unsigned char name[128];
+    int reports;
+    clock_t lastreport;
+    clock_t minreportdelta;
 } winrawdev;
 
 // Open registry key for reading corresponding to
@@ -72,13 +76,13 @@ void fillinfo(winrawdev *dev)
                                 &len);
     if(info == (UINT)-1)
     {
-        fprintf(stderr, "failed to get device name for %u\n", (uint)dev->device);
+        fprintf(stderr, "Failed to get device name for %u\n", dev->device);
         return;
     }
     HKEY reg;
     if(opendevicekey(dname, &reg) < 0)
     {
-        fprintf(stderr, "failed to open registry key for device %u (%s)\n", (uint)dev->device, dname);
+        fprintf(stderr, "Failed to open registry key for device %u (%s)\n", dev->device, dname);
         return;
     }
     DWORD type;
@@ -103,18 +107,18 @@ int listdevices(winrawdev *devs, int length)
     PRAWINPUTDEVICELIST rids;
     UINT numrids;
     UINT list = GetRawInputDeviceList(NULL, &numrids, sizeof(RAWINPUTDEVICELIST));
-    if(list == (UINT)-1) return -1;
+    if (list == (UINT)-1) return -1;
     rids = (PRAWINPUTDEVICELIST)malloc(numrids * sizeof(RAWINPUTDEVICELIST));
-    if(!rids) return -2;
+    if (!rids) return -2;
     list = GetRawInputDeviceList(rids, &numrids, sizeof(RAWINPUTDEVICELIST));
-    if(list == (UINT)-1)
+    if (list == (UINT)-1)
     {
         free(rids);
         return -3;
     }
     int fill = min(numrids, length);
     int i;
-    for(i = 0; i < fill; i++)
+    for (i = 0; i < fill; i++)
     {
         if(i >= length) break;
         devs[i].device = rids[i].hDevice;
@@ -123,6 +127,18 @@ int listdevices(winrawdev *devs, int length)
     }
     free(rids);
     return fill;
+}
+
+void showdevices(winrawdev *devs, int length)
+{
+    printf("--------------------\n");
+    printf("Devices:\n");
+    int i;
+    for (i = 0; i < length; i++)
+    {
+        printf("\t%s(%u)\n", devs[i].name, devs[i].device);
+    }
+    printf("--------------------\n");
 }
 
 // Register to receive input from desktop devices matching /usage/.
@@ -162,6 +178,10 @@ int handlerawinput(LPARAM lparam)
         return -1;
     }
     winrawdev *dev = lookupdev(raw.header.hDevice);
+    if (!dev)
+    {
+        fprintf(stderr, "Got event from unrecognized device.\nTry restarting program to detect new devices.\n");
+    }
     switch (raw.header.dwType)
     {
     case RIM_TYPEMOUSE:
@@ -193,12 +213,13 @@ const char *windowtitle = "rawinput";
 static winrawdev devices[maxdevices];
 static int numdevices = 0;
 static int paused = 0;
+
 winrawdev *lookupdev(HANDLE device)
 {
     int i;
     for(i = 0; i < numdevices; i++)
     {
-        if(devices[i].device == device) return &devices[i];
+        if (devices[i].device == device) return &devices[i];
     }
     return NULL;
 }
@@ -220,54 +241,82 @@ const float anglediff(const winrawdev *const from, const winrawdev *const to)
     const float afrom = atan2f(from->history.dx, from->history.dy);
     return ato - afrom;
 }
+const char *describeanglediff(float adiff)
+{
+    const float a = fabs(adiff);
+    return
+        a == 0 ? "Perfect"
+        : a < 0.01 ? "Excellent"
+        : a < 0.05 ? "Very Good"
+        : a < 0.10 ? "Good"
+        : a < 0.15 ? "Adequate"
+        : a < 0.20 ? "Questionable"
+        : a < 0.30 ? "Bad"
+        : a < 0.50 ? "Terrible"
+        : "You didn't move them together, did you?"
+        ;
+}
 void showconversions(const winrawdev *const from)
 {
-    if(from->type != RIM_TYPEMOUSE || !(from->history.dx || from->history.dy)) return;
+    if (from->type != RIM_TYPEMOUSE || !(from->history.dx || from->history.dy)) return;
+    printf("Device %s(%u)\n", from->name, from->device);
+    double hz = 1.0 / ((double)(from->minreportdelta) / CLOCKS_PER_SEC);
+    printf
+        ("\tHz (max): %.0f\n"
+         "\tDelta (x, y): (%d, %d)\n"
+         , hz
+         , from->history.dx
+         , from->history.dy
+        );
+    if (numdevices < 2) return;
     int i;
-    printf("from %u:%s\n", (uint)from->device, from->name);
-    for(i = 0; i < numdevices; i++)
+    printf("  To go from %s(%u)\n", from->name, from->device);
+    for (i = 0; i < numdevices; i++)
     {
-        if(devices[i].type == RIM_TYPEMOUSE &&
+        if (devices[i].type == RIM_TYPEMOUSE &&
            &devices[i] != from &&
            (devices[i].history.dx || devices[i].history.dy))
         {
-            printf("\tto %u:%s:\n\tconversion: %.3f\n\tmeasurement error estimate: %.3f\n",
-                   (uint)devices[i].device,
-                   devices[i].name,
-                   conversion(from, &devices[i]),
-                   anglediff(from, &devices[i]));
+            float adiff = anglediff(from, &devices[i]);
+            printf
+                ("\tto %s(%u):\n"
+                 "\t\tMultiply sensitivity by: %.3f\n"
+                 "\t\tAngle offset: %.2f (%s)\n\n"
+                 , devices[i].name
+                 , devices[i].device
+                 , conversion(from, &devices[i])
+                 , adiff
+                 , describeanglediff(adiff)
+                );
         }
     }
 }
 void handlekeyboard(winrawdev *device, int vkey, unsigned int flags)
 {
-    if(flags & RI_KEY_BREAK) return;
+    if (flags & RI_KEY_BREAK) return;
     switch(vkey)
     {
-    case VK_ESCAPE:
-        exit(0);
-        break;
     case VK_DELETE:
-    case VK_RETURN:
+    case 'R':
     {
         int i;
-        for(i = 0; i < numdevices; i++)
+        for (i = 0; i < numdevices; i++)
         {
             devices[i].history.dx = devices[i].history.dy = 0;
         }
-        printf("history reset\n");
+        printf("History reset.\n");
         break;
     }
     case VK_SPACE:
     {
         paused ^= 1;
-        printf("%spaused\n", paused ? "" : "un");
+        printf("%saused.\n", paused ? "P" : "Unp");
         break;
     }
-    default:
+    case 'S':
     {
         int i;
-        for(i = 0; i < numdevices; i++)
+        for (i = 0; i < numdevices; i++)
         {
             showconversions(&devices[i]);
         }
@@ -277,15 +326,40 @@ void handlekeyboard(winrawdev *device, int vkey, unsigned int flags)
 
 void handlemouse(winrawdev *device, int dx, int dy)
 {
-    if(paused) return;
+    if (paused) return;
     device->history.dx += dx;
     device->history.dy += dy;
-    printf("%u:%s\n", (uint)device->device, device->name);
+    if (!device->reports)
+    {
+        printf("Got mouse movement from %s(%u)\n", device->name, device->device);
+        device->minreportdelta = -1;
+    }
+    else
+    {
+        clock_t delta = clock() - device->lastreport;
+        if (delta != 0
+            && (device->minreportdelta == -1 || delta < device->minreportdelta))
+        {
+            device->minreportdelta = delta;
+        }
+    }
+    device->reports++;
+    device->lastreport = clock();
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hignore, LPSTR lpignore, int nCmdShow)
 {
+    printf(
+        "Directions:\n"
+        "\tMove both mice together as one, then hit S to show stats.\n"
+        "Controls:\n"
+        "\tS = Show stats.\n"
+        "\tR = Reset history.\n"
+        "\t    Useful if you messed up and want to run another test.\n"
+        "\tSPACE = Pause/unpause recording mouse movements.\n"
+        );
     numdevices = listdevices(devices, maxdevices);
+    showdevices(devices, numdevices);
 
     WNDCLASS wc;
     HWND hwnd;
